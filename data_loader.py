@@ -15,15 +15,20 @@ from sqlalchemy import create_engine, text
 REQUIRED_KEYS = ["item_no", "colour_no", "size", "barcode"]
 RANK_MODES = ["Blended", "Missed Revenue", "Markdown Risk", "Mismatch Severity"]
 
+# Shared labels for charts (charts.py uses VIZ_* constants; keep aliases for imports).
 SERIES_COLORS = {
-    "historical_buy_pct": "#1d4ed8",
+    "historical_buy_pct": "#94a3b8",
     "true_demand_pct": "#ea580c",
-    "buy_share": "#1d4ed8",
+    "buy_share": "#64748b",
     "demand_share": "#ea580c",
-    "conservative": "#7c3aed",
-    "base": "#0f766e",
-    "optimistic": "#d97706",
+    "conservative": "#cbd5e1",
+    "base": "#64748b",
+    "optimistic": "#94a3b8",
 }
+
+# Optimization Engine: simple rubric for € impact of rebalancing a fixed PO quantity.
+MARKDOWN_RATE = 0.2
+INCREMENTAL_CONTRIBUTION_RATE = 0.35  # contribution € per € list on incremental buy toward demand
 
 # ---------------------------------------------------------------------------
 # Physical column names per table (adjust if your Lions Fashion schema differs)
@@ -366,9 +371,13 @@ def build_executive_narrative(df: pd.DataFrame, horizon_days: int) -> tuple[list
     return bullets, {"lost_revenue": lost_rev, "margin_eroded": margin_er, "working_capital": wc}
 
 
-def profile_recommendation(
-    df: pd.DataFrame, brand: str, category: str, fit: str, size_group: str, target_qty: int, style: str
-) -> tuple[pd.DataFrame, dict]:
+def _resolve_profile_local(
+    df: pd.DataFrame, brand: str, category: str, fit: str, size_group: str, style: str
+) -> tuple[pd.DataFrame, float, bool]:
+    """
+    Row-level scope for a buying profile, including fallback when sample is thin.
+    Returns (local_df, sold_units, fallback_used).
+    """
     local = df[
         (df["brand"] == brand) & (df["category"] == category) & (df["fit"] == fit) & (df["size_group"] == size_group)
     ].copy()
@@ -382,6 +391,13 @@ def profile_recommendation(
         local = in_group if not in_group.empty else broad[broad["size"].isin(local["size"].unique())]
         if local.empty:
             local = df[df["size_group"] == size_group].copy()
+    return local, sold_units, fallback_used
+
+
+def profile_recommendation(
+    df: pd.DataFrame, brand: str, category: str, fit: str, size_group: str, target_qty: int, style: str
+) -> tuple[pd.DataFrame, dict]:
+    local, sold_units, fallback_used = _resolve_profile_local(df, brand, category, fit, size_group, style)
     size_curve = local.groupby("size", dropna=False)["sales_qty"].sum().reset_index()
     if size_curve.empty:
         return pd.DataFrame(), {"fallback_used": fallback_used, "sold_units": sold_units, "confidence": "Low"}
@@ -401,3 +417,98 @@ def profile_recommendation(
         "confidence": confidence,
     }
     return size_curve.sort_values("size"), meta
+
+
+def build_optimization_detail(
+    df: pd.DataFrame,
+    brand: str,
+    category: str,
+    fit: str,
+    size_group: str,
+    target_qty: int,
+    style: str,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Full optimization story for UI: historical buy curve vs demand-optimal curve at ``target_qty``,
+    variance in percentage points, and a simple € projection per size from moving units.
+
+    Historical PO shape uses observed ``buy_qty`` shares; optimal uses demand (``sales_qty``) shares.
+    Both are integer-allocated with largest remainder to the same target so quantities are comparable.
+
+    Margin heuristic (transparent for the Head of Buying):
+    - Extra units vs historical curve → incremental contribution at INCREMENTAL_CONTRIBUTION_RATE × list price.
+    - Fewer units vs historical curve → avoided markdown risk at MARKDOWN_RATE × list price.
+    """
+    local, sold_units, fallback_used = _resolve_profile_local(df, brand, category, fit, size_group, style)
+    agg = (
+        local.groupby("size", dropna=False)
+        .agg(sales_qty=("sales_qty", "sum"), buy_qty=("buy_qty", "sum"), avg_list_price=("list_price", "mean"))
+        .reset_index()
+    )
+    if agg.empty:
+        return pd.DataFrame(), {
+            "fallback_used": fallback_used,
+            "sold_units": sold_units,
+            "profile_label": f"{brand} · {category} · {fit} · {size_group}",
+            "total_projected_margin_eur": 0.0,
+            "confidence": "Low",
+        }
+
+    total_sales = max(agg["sales_qty"].sum(), 1.0)
+    total_buy = float(agg["buy_qty"].sum())
+    n_sizes = max(len(agg), 1)
+    agg["demand_share"] = agg["sales_qty"] / total_sales
+    if total_buy > 0:
+        agg["historical_buy_share"] = agg["buy_qty"] / total_buy
+    else:
+        agg["historical_buy_share"] = 1.0 / n_sizes
+
+    qty_optimal = largest_remainder_alloc(agg.set_index("size")["demand_share"], target_qty, agg.set_index("size")["sales_qty"])
+    qty_historical = largest_remainder_alloc(
+        agg.set_index("size")["historical_buy_share"], target_qty, agg.set_index("size")["buy_qty"]
+    )
+
+    agg = agg.set_index("size")
+    agg["qty_optimal_at_target"] = qty_optimal.reindex(agg.index).fillna(0).astype(int)
+    agg["qty_historical_at_target"] = qty_historical.reindex(agg.index).fillna(0).astype(int)
+    agg["delta_qty"] = agg["qty_optimal_at_target"] - agg["qty_historical_at_target"]
+    agg["alloc_share_optimal"] = agg["qty_optimal_at_target"] / max(target_qty, 1)
+    agg["alloc_share_historical"] = agg["qty_historical_at_target"] / max(target_qty, 1)
+    agg["variance_pp"] = (agg["alloc_share_optimal"] - agg["alloc_share_historical"]) * 100.0
+    agg["curve_gap_pp"] = (agg["demand_share"] - agg["historical_buy_share"]) * 100.0
+
+    price = agg["avg_list_price"].fillna(0.0)
+    inc = (agg["delta_qty"] > 0) * agg["delta_qty"] * price * INCREMENTAL_CONTRIBUTION_RATE
+    dec = (agg["delta_qty"] < 0) * (-agg["delta_qty"]) * price * MARKDOWN_RATE
+    agg["projected_margin_eur"] = (inc + dec).round(2)
+    agg = agg.reset_index()
+
+    coverage = len(local[REQUIRED_KEYS + ["sales_qty"]].dropna()) / max(len(local), 1)
+    latest = pd.to_datetime(local["order_date"], errors="coerce").max()
+    freshness = (pd.Timestamp.today() - latest).days if pd.notna(latest) else 999
+    confidence = confidence_label(sold_units, coverage, freshness, fallback_used)
+
+    detail = agg.sort_values("size").rename(
+        columns={
+            "size": "Size",
+            "historical_buy_share": "hist_buy_share",
+            "demand_share": "optimal_demand_share",
+            "alloc_share_historical": "po_share_historical_curve",
+            "alloc_share_optimal": "po_share_optimal_curve",
+        }
+    )
+
+    total_proj = float(detail["projected_margin_eur"].sum())
+    meta = {
+        "fallback_used": fallback_used,
+        "sold_units": sold_units,
+        "coverage": coverage,
+        "freshness_days": freshness,
+        "confidence": confidence,
+        "profile_label": f"{brand} · {category} · {fit} · {size_group}",
+        "target_qty": target_qty,
+        "total_projected_margin_eur": total_proj,
+    }
+    if style != "All":
+        meta["profile_label"] += f" · style {style}"
+    return detail, meta
