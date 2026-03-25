@@ -16,6 +16,8 @@ sales_agg AS (
   SELECT
     item_no, colour_no, size, barcode,
     SUM(COALESCE(quantity::double precision, 0)) AS sales_quantity,
+    -- Ex-VAT sales turnover (match data_loader; list price VAT handled in app via NL_VAT_DIVISOR)
+    SUM(COALESCE(amount_lcy::double precision, 0)) AS sales_revenue_agg,
     MAX(order_date) AS sales_order_date,
     MAX(NULLIF(trim(both from season::text), '')) AS sales_season,
     MAX(NULLIF(trim(both from brand::text), '')) AS sales_brand
@@ -56,6 +58,7 @@ SELECT
   k.size,
   k.barcode,
   s.sales_quantity,
+  s.sales_revenue_agg,
   s.sales_order_date,
   s.sales_season,
   s.sales_brand,

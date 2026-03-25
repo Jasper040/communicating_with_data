@@ -137,3 +137,12 @@ def apply_global_controls(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "min_confidence": min_confidence,
         "rank_mode": rank_mode,
     }
+
+
+def render_scope_summary(control_cfg: dict | None, row_count: int) -> None:
+    """Read-only context strip (sidebar remains source of truth for filters)."""
+    if not control_cfg:
+        return
+    h = control_cfg.get("horizon", "—")
+    as_of = control_cfg.get("as_of", "—")
+    st.caption(f"Scope · Horizon: **{h}** · As-of: **{as_of}** · Rows in view: **{row_count:,}**")

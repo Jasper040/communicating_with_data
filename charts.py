@@ -5,14 +5,23 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from data_loader import SERIES_COLORS
+from data_loader import SERIES_COLORS, VIZ_ACCENT
 
-# Neutral / historical baseline (slate grays + muted blue)
+# Neutral / historical baseline (slate grays)
 VIZ_NEUTRAL = "#94a3b8"
 VIZ_NEUTRAL_DEEP = "#64748b"
 VIZ_NEUTRAL_LIGHT = "#cbd5e1"
-# Single accent: demand, gap, optimal action
-VIZ_ACCENT = "#ea580c"
+
+_GRID = "#e2e8f0"
+
+
+def _finish_bi_chart(chart: alt.Chart) -> alt.Chart:
+    """Shared BI-style axis/grid/title defaults (light grid, no heavy domain lines)."""
+    return (
+        chart.configure_axis(grid=True, gridColor=_GRID, domain=False, tickColor="#94a3b8", labelColor="#475569")
+        .configure_view(strokeWidth=0)
+        .configure_title(anchor="start", fontSize=15, fontWeight=600, color="#0f172a", offset=8)
+    )
 
 
 def render_bleed_chart(df: pd.DataFrame, horizon_days: int) -> None:
@@ -56,10 +65,8 @@ def render_bleed_chart(df: pd.DataFrame, horizon_days: int) -> None:
             ],
         )
         .properties(height=380, title="Historical buy % vs true demand %")
-        .configure_axis(grid=True, gridColor="#f1f5f9")
-        .configure_view(strokeWidth=0)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(_finish_bi_chart(chart), use_container_width=True)
 
 
 def render_mismatch_chart(mismatch: pd.DataFrame) -> None:
@@ -96,10 +103,8 @@ def render_mismatch_chart(mismatch: pd.DataFrame) -> None:
             ],
         )
         .properties(height=380, title="Buy share vs demand share by size")
-        .configure_axis(grid=True, gridColor="#f1f5f9")
-        .configure_view(strokeWidth=0)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(_finish_bi_chart(chart), use_container_width=True)
 
 
 def render_forecast_chart(df: pd.DataFrame, horizon_days: int) -> None:
@@ -129,7 +134,7 @@ def render_forecast_chart(df: pd.DataFrame, horizon_days: int) -> None:
                 "scenario:N",
                 title=None,
                 sort=scenario_labels,
-                # Muted bands + orange accent on the base / demand anchor scenario.
+                # Muted bands + maroon accent on the base / demand anchor scenario.
                 scale=alt.Scale(
                     domain=scenario_labels,
                     range=[VIZ_NEUTRAL_LIGHT, VIZ_ACCENT, VIZ_NEUTRAL_LIGHT],
@@ -149,10 +154,8 @@ def render_forecast_chart(df: pd.DataFrame, horizon_days: int) -> None:
             ],
         )
         .properties(height=380, title="Demand projection by size")
-        .configure_axis(grid=True, gridColor="#f1f5f9")
-        .configure_view(strokeWidth=0)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(_finish_bi_chart(chart), use_container_width=True)
 
 
 def render_optimization_po_curve_comparison(detail: pd.DataFrame) -> None:
@@ -203,10 +206,8 @@ def render_optimization_po_curve_comparison(detail: pd.DataFrame) -> None:
             height=400,
             title="Historical buy curve vs data-driven optimal (same PO quantity, largest-remainder allocation)",
         )
-        .configure_axis(grid=True, gridColor="#f1f5f9")
-        .configure_view(strokeWidth=0)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(_finish_bi_chart(chart), use_container_width=True)
 
 
 def render_optimization_gap_and_margin(detail: pd.DataFrame) -> None:
@@ -216,17 +217,16 @@ def render_optimization_gap_and_margin(detail: pd.DataFrame) -> None:
     size_order = detail["Size"].astype(str).tolist()
 
     gap = detail[["Size", "variance_pp"]].copy()
+    gap["bar_color"] = gap["variance_pp"].apply(
+        lambda v: VIZ_ACCENT if v > 0 else (VIZ_NEUTRAL_DEEP if v < 0 else VIZ_NEUTRAL_LIGHT)
+    )
     bar_gap = (
         alt.Chart(gap)
         .mark_bar(cornerRadiusEnd=2)
         .encode(
             x=alt.X("Size:N", sort=size_order, title="Size"),
             y=alt.Y("variance_pp:Q", axis=alt.Axis(title="Δ PO share (optimal − historical), pp")),
-            color=alt.condition(
-                alt.datum.variance_pp > 0,
-                alt.value(VIZ_ACCENT),
-                alt.condition(alt.datum.variance_pp < 0, alt.value(VIZ_NEUTRAL_DEEP), alt.value(VIZ_NEUTRAL_LIGHT)),
-            ),
+            color=alt.Color("bar_color:N", scale=None, legend=None),
             tooltip=[
                 alt.Tooltip("Size:N", title="Size"),
                 alt.Tooltip("variance_pp:Q", format="+.1f", title="Δ pp"),
@@ -259,10 +259,49 @@ def render_optimization_gap_and_margin(detail: pd.DataFrame) -> None:
         .properties(height=320, title="Per-size € lift from moving toward the optimal curve")
     )
 
-    combined = (
-        (bar_gap | bar_margin)
-        .resolve_scale(color="independent")
-        .configure_axis(grid=True, gridColor="#f1f5f9")
-        .configure_view(strokeWidth=0)
+    combined = (bar_gap | bar_margin).resolve_scale(color="independent")
+    st.altair_chart(_finish_bi_chart(combined), use_container_width=True)
+
+
+def render_action_queue_priority_chart(df: pd.DataFrame, *, top_n: int = 15) -> None:
+    """Horizontal bar: top profiles by priority score (BI-style ranking strip)."""
+    if df.empty or "priority_score" not in df.columns:
+        return
+    plot = df.nlargest(int(top_n), "priority_score").copy()
+    plot["label"] = (
+        plot["brand"].astype(str)
+        + " · "
+        + plot["category"].astype(str)
+        + " · "
+        + plot["fit"].astype(str)
+        + " · "
+        + plot["size_group"].astype(str)
     )
-    st.altair_chart(combined, use_container_width=True)
+    plot["label"] = plot["label"].str.slice(0, 96)
+    chart = (
+        alt.Chart(plot)
+        .mark_bar(cornerRadiusEnd=2, color=VIZ_ACCENT)
+        .encode(
+            y=alt.Y(
+                "label:N",
+                sort=alt.EncodingSortField(field="priority_score", order="descending"),
+                title=None,
+                axis=alt.Axis(labelLimit=280),
+            ),
+            x=alt.X(
+                "priority_score:Q",
+                title="Priority score",
+                axis=alt.Axis(format=".0f"),
+            ),
+            tooltip=[
+                alt.Tooltip("label:N", title="Profile"),
+                alt.Tooltip("priority_score:Q", format=".1f", title="Score"),
+                alt.Tooltip("confidence:N", title="Confidence"),
+            ],
+        )
+        .properties(
+            height=min(36 * len(plot) + 72, 720),
+            title=f"Top {len(plot)} actions by priority",
+        )
+    )
+    st.altair_chart(_finish_bi_chart(chart), use_container_width=True)

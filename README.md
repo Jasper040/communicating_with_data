@@ -41,7 +41,8 @@ If pages still don’t appear, confirm you’re not running a file inside `pages
 ## Data merge (SQL, not `SELECT *`)
 
 Merged facts are loaded in **one query** with joins and aggregation in PostgreSQL (`data_loader.load_and_merge_data`).  
-If your physical column names differ (e.g. `qty` instead of `quantity`), set env vars such as `PG_SALES_QTY_COL`, `PG_INV_STOCK_COL`, etc., or adjust `data_loader.py`.
+If your physical column names differ (e.g. `qty` instead of `quantity`), set env vars such as `PG_SALES_QTY_COL`, `PG_INV_STOCK_COL`, etc., or adjust `data_loader.py`.  
+Product **sales listprice** is treated as incl. NL VAT (`1.21`); sales amounts are ex VAT — see `NL_VAT_DIVISOR` and `PG_SALES_EX_VAT_AMOUNT_COL` in `data_loader.py`.
 
 Optional DBA view DDL: `docs/sql/buying_facts_merge_view.sql`.
 

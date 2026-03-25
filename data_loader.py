@@ -7,6 +7,7 @@ to avoid SELECT * and in-Python full outer merges.
 from __future__ import annotations
 
 import os
+import re
 
 import pandas as pd
 import streamlit as st
@@ -15,20 +16,27 @@ from sqlalchemy import create_engine, text
 REQUIRED_KEYS = ["item_no", "colour_no", "size", "barcode"]
 RANK_MODES = ["Blended", "Missed Revenue", "Markdown Risk", "Mismatch Severity"]
 
-# Shared labels for charts (charts.py uses VIZ_* constants; keep aliases for imports).
+# Shared labels for charts — slate neutrals + deep maroon accent (Power BI–style discipline).
+VIZ_ACCENT = "#991b1b"
 SERIES_COLORS = {
     "historical_buy_pct": "#94a3b8",
-    "true_demand_pct": "#ea580c",
+    "true_demand_pct": "#991b1b",
     "buy_share": "#64748b",
-    "demand_share": "#ea580c",
+    "demand_share": "#991b1b",
     "conservative": "#cbd5e1",
-    "base": "#64748b",
+    "base": "#991b1b",
     "optimistic": "#94a3b8",
 }
 
 # Optimization Engine: simple rubric for € impact of rebalancing a fixed PO quantity.
 MARKDOWN_RATE = 0.2
 INCREMENTAL_CONTRIBUTION_RATE = 0.35  # contribution € per € list on incremental buy toward demand
+
+# Missed revenue: SKUs with realized gross margin below this floor are treated as "written off" (no missed revenue).
+MARGIN_WRITE_OFF_FLOOR = float(os.getenv("MARGIN_WRITE_OFF_FLOOR", "0.60"))
+
+# Products list price (`sales_listprice`) is incl. 21% NL VAT; sales table amounts are ex VAT — divide for like-for-like.
+NL_VAT_DIVISOR = float(os.getenv("NL_VAT_DIVISOR", "1.21"))
 
 # ---------------------------------------------------------------------------
 # Physical column names per table (adjust if your Lions Fashion schema differs)
@@ -51,6 +59,26 @@ PROD_BRAND_COL = os.getenv("PG_PROD_BRAND_COL", "brand")
 PROD_ITEM_GROUP_COL = os.getenv("PG_PROD_ITEM_GROUP_COL", "item_group")
 PROD_FIT_COL = os.getenv("PG_PROD_FIT_COL", "fit")
 PROD_SIZE_GROUP_COL = os.getenv("PG_PROD_SIZE_GROUP_COL", "size_group")
+
+# Net sales for ASP / write-off: SUM ex-VAT turnover per SKU from `total_sales_b2c` (see `_sales_revenue_agg_sql`).
+# Implied discount vs ticket is computed in Python: qty × (list_incl_vat / NL_VAT_DIVISOR) − actual ex-VAT revenue.
+PG_SALES_REVENUE_COL = os.getenv("PG_SALES_REVENUE_COL", "").strip()
+PG_SALES_EX_VAT_AMOUNT_COL = os.getenv("PG_SALES_EX_VAT_AMOUNT_COL", "amount_lcy")
+
+
+def _validated_identifier(name: str, label: str) -> str:
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(name)):
+        raise ValueError(f"Invalid {label} (use letters, digits, underscore).")
+    return str(name)
+
+
+def _sales_revenue_agg_sql() -> str:
+    """Single-column override, or default SUM ex-VAT sales amount per SKU (NL: revenue ex VAT vs list incl VAT in products)."""
+    if PG_SALES_REVENUE_COL:
+        col = _validated_identifier(PG_SALES_REVENUE_COL, "PG_SALES_REVENUE_COL")
+        return f'SUM(COALESCE("{col}"::double precision, 0)) AS sales_revenue_agg'
+    col = _validated_identifier(PG_SALES_EX_VAT_AMOUNT_COL, "PG_SALES_EX_VAT_AMOUNT_COL")
+    return f'SUM(COALESCE("{col}"::double precision, 0)) AS sales_revenue_agg'
 
 
 def get_postgres_config() -> dict:
@@ -122,6 +150,7 @@ sales_agg AS (
   SELECT
     item_no, colour_no, size, barcode,
     SUM(COALESCE("{SALES_QTY_COL}"::double precision, 0)) AS sales_quantity,
+    {_sales_revenue_agg_sql()},
     MAX("{SALES_DATE_COL}") AS sales_order_date,
     MAX(NULLIF(trim(both from "{SALES_SEASON_COL}"::text), '')) AS sales_season,
     MAX(NULLIF(trim(both from "{SALES_BRAND_COL}"::text), '')) AS sales_brand
@@ -162,6 +191,7 @@ SELECT
   k.size,
   k.barcode,
   s.sales_quantity,
+  s.sales_revenue_agg,
   s.sales_order_date,
   s.sales_season,
   s.sales_brand,
@@ -224,6 +254,8 @@ def with_common_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["buy_qty"] = _numeric(out, "pur_quantity")
     out["stock_qty"] = _numeric(out, "inv_stock")
     out["list_price"] = _numeric(out, "prod_sales_listprice")
+    # Ticket / list from products is incl. VAT; compare to ex-VAT sales using NL divisor.
+    out["list_price_ex_vat"] = out["list_price"] / NL_VAT_DIVISOR
     out["unit_cost"] = _numeric(out, "pur_purchase_price").where(
         _numeric(out, "pur_purchase_price") > 0, _numeric(out, "prod_sales_listprice") * 0.5
     )
@@ -237,7 +269,40 @@ def with_common_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["fit"] = _text(out, "prod_fit")
     out["size_group"] = _text(out, "prod_size_group")
     out["style"] = _text(out, "item_no")
+    out["sales_revenue"] = _numeric(out, "sales_revenue_agg")
+    # Implied markdown/discount € = ticket value ex VAT − actual ex-VAT revenue (no discount column).
+    out["theoretical_revenue_ex_vat"] = out["sales_qty"] * out["list_price_ex_vat"]
+    out["implied_discount_eur"] = (out["theoretical_revenue_ex_vat"] - out["sales_revenue"]).clip(lower=0)
+    theo = out["theoretical_revenue_ex_vat"].replace(0, pd.NA)
+    out["implied_discount_pct"] = (out["implied_discount_eur"] / theo).fillna(0.0).clip(0.0, 1.0)
     return out
+
+
+def missed_revenue_weight(df: pd.DataFrame) -> pd.Series:
+    """
+    Per-SKU weight in [0, 1] for missed-revenue style metrics.
+
+    Uses gross margin = (ASP − unit_cost) / ASP with ASP = ex-VAT net sales / units (from sales lines).
+    Product list is incl. VAT; revenue is ex VAT — implied discount is not used in this ratio.
+    If net revenue is missing on the row, falls back to list behaviour via ~use_realized mask.
+
+    Weight is 0 when margin is below MARGIN_WRITE_OFF_FLOOR (default 60%): treated as written off /
+    too heavily discounted to count as recoverable missed revenue.
+    """
+    lp_ex = _numeric(df, "list_price_ex_vat") if "list_price_ex_vat" in df.columns else _numeric(df, "list_price") / NL_VAT_DIVISOR
+    cost = _numeric(df, "unit_cost")
+    qty = _numeric(df, "sales_qty")
+    rev = _numeric(df, "sales_revenue")
+    asp = lp_ex.copy()
+    use_realized = (qty > 0) & (rev > 0)
+    asp = asp.where(~use_realized, rev / qty)
+    margin = (asp - cost) / asp.replace(0, pd.NA)
+    w = (margin >= MARGIN_WRITE_OFF_FLOOR).astype(float)
+    w = w.mask(asp <= 0, 0.0)
+    w = w.mask((asp > 0) & margin.isna(), 1.0)
+    # Write-off only when net sales are present (discounts reflected in ASP); else legacy missed revenue.
+    w = w.mask(~use_realized, 1.0)
+    return w.clip(0.0, 1.0)
 
 
 def normalize_0_100(values: pd.Series) -> pd.Series:
@@ -269,17 +334,22 @@ def confidence_label(sold_units: float, coverage: float, freshness_days: int, fa
     return "Medium"
 
 
-def compute_kpis(df: pd.DataFrame, horizon_days: int) -> tuple[float, float, float]:
-    daily_rate = (df["sales_qty"].sum() / max(horizon_days, 1)) if not df.empty else 0
+def compute_kpis(df: pd.DataFrame, horizon_days: int) -> tuple[float, float, float, float]:
+    if df.empty:
+        return 0.0, 0.0, 0.0, 0.0
+    daily_rate = df["sales_qty"].sum() / max(horizon_days, 1)
     expected_units = max(daily_rate * horizon_days, 0)
-    lost_revenue = float(((expected_units - df["stock_qty"]).clip(lower=0) * df["list_price"]).sum())
+    w = missed_revenue_weight(df)
+    raw_lost = (expected_units - df["stock_qty"]).clip(lower=0) * df["list_price"]
+    lost_revenue = float((raw_lost * w).sum())
+    missed_revenue_excluded_writeoff = float((raw_lost * (1.0 - w)).sum())
     overstock_units = (df["stock_qty"] - df["sales_qty"]).clip(lower=0)
     margin_eroded = float((overstock_units * df["list_price"] * 0.2).sum())
     sell_through = df["sales_qty"] / df["stock_qty"].replace(0, pd.NA)
     capital_at_risk = float(
         (df["stock_qty"] * df["unit_cost"] * (sell_through.fillna(0) < 0.3).astype(float)).sum()
     )
-    return lost_revenue, margin_eroded, capital_at_risk
+    return lost_revenue, margin_eroded, capital_at_risk, missed_revenue_excluded_writeoff
 
 
 def _row_level_risk_frames(df: pd.DataFrame) -> pd.DataFrame:
@@ -287,8 +357,9 @@ def _row_level_risk_frames(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    # Understock value proxy: demand not covered by on-hand at row grain
-    out["_understock_value"] = (out["sales_qty"] - out["stock_qty"]).clip(lower=0) * out["list_price"]
+    # Understock value proxy: demand not covered by on-hand at row grain (written-off SKUs excluded)
+    w = missed_revenue_weight(out)
+    out["_understock_value"] = (out["sales_qty"] - out["stock_qty"]).clip(lower=0) * out["list_price"] * w
     overstock = (out["stock_qty"] - out["sales_qty"]).clip(lower=0)
     out["_margin_eroded_row"] = overstock * out["list_price"] * 0.2
     st_ratio = out["sales_qty"] / out["stock_qty"].replace(0, pd.NA)
@@ -301,7 +372,7 @@ def build_executive_narrative(df: pd.DataFrame, horizon_days: int) -> tuple[list
     """
     Return markdown-friendly headline bullets and KPI numbers for the executive view.
     """
-    lost_rev, margin_er, wc = compute_kpis(df, horizon_days)
+    lost_rev, margin_er, wc, excl = compute_kpis(df, horizon_days)
     bullets: list[str] = []
 
     if df.empty:
@@ -309,6 +380,7 @@ def build_executive_narrative(df: pd.DataFrame, horizon_days: int) -> tuple[list
             "lost_revenue": lost_rev,
             "margin_eroded": margin_er,
             "working_capital": wc,
+            "missed_revenue_excluded_writeoff": excl,
         }
 
     enriched = _row_level_risk_frames(df)
@@ -368,7 +440,12 @@ def build_executive_narrative(df: pd.DataFrame, horizon_days: int) -> tuple[list
     if not bullets:
         bullets.append("### Snapshot\n\nNo major anomalies detected in this scope — KPIs look relatively balanced.")
 
-    return bullets, {"lost_revenue": lost_rev, "margin_eroded": margin_er, "working_capital": wc}
+    return bullets, {
+        "lost_revenue": lost_rev,
+        "margin_eroded": margin_er,
+        "working_capital": wc,
+        "missed_revenue_excluded_writeoff": excl,
+    }
 
 
 def _resolve_profile_local(

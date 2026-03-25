@@ -2,8 +2,9 @@ import streamlit as st
 
 st.set_page_config(page_title="Action Queue | Buying", layout="wide")
 
-from app_shell import render_app_shell
-from data_loader import normalize_0_100
+from app_shell import render_app_shell, render_scope_summary
+from charts import render_action_queue_priority_chart
+from data_loader import missed_revenue_weight, normalize_0_100
 
 st.header("Action Queue")
 
@@ -14,9 +15,17 @@ if scoped.empty:
     st.warning("No rows match current filters.")
     st.stop()
 
+render_scope_summary(cfg, len(scoped))
+
 rank_mode = cfg["rank_mode"]
 confidence_floor = cfg["min_confidence"]
 
+scoped = scoped.copy()
+scoped["_missed_rev_row"] = (
+    (scoped["sales_qty"] - scoped["stock_qty"]).clip(lower=0)
+    * scoped["list_price"]
+    * missed_revenue_weight(scoped)
+)
 profile = (
     scoped.groupby(["brand", "category", "fit", "size_group"], dropna=False)
     .agg(
@@ -24,10 +33,10 @@ profile = (
         buy_units=("buy_qty", "sum"),
         stock_units=("stock_qty", "sum"),
         avg_price=("list_price", "mean"),
+        missed_revenue_raw=("_missed_rev_row", "sum"),
     )
     .reset_index()
 )
-profile["missed_revenue_raw"] = (profile["sold_units"] - profile["stock_units"]).clip(lower=0) * profile["avg_price"]
 profile["markdown_risk_raw"] = (profile["stock_units"] - profile["sold_units"]).clip(lower=0) * profile["avg_price"] * 0.2
 profile["mismatch_raw"] = (profile["buy_units"] - profile["sold_units"]).abs()
 profile["missed_revenue_score"] = normalize_0_100(profile["missed_revenue_raw"])
@@ -52,7 +61,12 @@ profile["suggested_action"] = "Rebalance buy curve for next PO"
 output = profile[
     ["brand", "category", "fit", "size_group", score_col, "confidence", "suggested_action"]
 ].rename(columns={score_col: "priority_score"})
-st.dataframe(output, use_container_width=True)
+with st.container(border=True):
+    st.markdown("##### Priority ranking (top profiles)")
+    render_action_queue_priority_chart(output, top_n=15)
+with st.container(border=True):
+    st.markdown("##### Full shortlist")
+    st.dataframe(output, use_container_width=True)
 st.download_button(
     "Export action shortlist",
     output.to_csv(index=False).encode("utf-8"),

@@ -1,0 +1,10 @@
+[theme]
+# Buying Control Tower — BI-style light canvas + deep maroon accent
+primaryColor = "#991b1b"
+backgroundColor = "#f1f5f9"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#0f172a"
+font = "sans serif"
+
+[theme.sidebar]
+secondaryBackgroundColor = "#f8fafc"
