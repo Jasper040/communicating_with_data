@@ -29,11 +29,19 @@ SERIES_COLORS = {
 }
 
 # Optimization Engine: simple rubric for € impact of rebalancing a fixed PO quantity.
-MARKDOWN_RATE = 0.2
+MARKDOWN_RATE = 0.3
 INCREMENTAL_CONTRIBUTION_RATE = 0.35  # contribution € per € list on incremental buy toward demand
 
 # Missed revenue: SKUs with realized gross margin below this floor are treated as "written off" (no missed revenue).
 MARGIN_WRITE_OFF_FLOOR = float(os.getenv("MARGIN_WRITE_OFF_FLOOR", "0.60"))
+
+# SKU-rows with unit net revenue (ex VAT) at or below this are treated as intentional free / giveaway / comp:
+# margin write-off does not apply (missed_revenue_weight stays 1 for those rows). Quantities and € still flow
+# into demand, totals, and other KPIs unchanged.
+FREE_OR_GIVEAWAY_UNIT_REVENUE_MAX_EUR = float(os.getenv("FREE_OR_GIVEAWAY_UNIT_REVENUE_MAX_EUR", "0.01"))
+
+# Stock-out missed revenue only: zero weight when as-of is more than this many weeks after first sale (per SKU in merge).
+STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE = float(os.getenv("STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE", "20"))
 
 # Products list price (`sales_listprice`) is incl. 21% NL VAT; sales table amounts are ex VAT — divide for like-for-like.
 NL_VAT_DIVISOR = float(os.getenv("NL_VAT_DIVISOR", "1.21"))
@@ -60,10 +68,31 @@ PROD_ITEM_GROUP_COL = os.getenv("PG_PROD_ITEM_GROUP_COL", "item_group")
 PROD_FIT_COL = os.getenv("PG_PROD_FIT_COL", "fit")
 PROD_SIZE_GROUP_COL = os.getenv("PG_PROD_SIZE_GROUP_COL", "size_group")
 
-# Net sales for ASP / write-off: SUM ex-VAT turnover per SKU from `total_sales_b2c` (see `_sales_revenue_agg_sql`).
+# Net sales for ASP / write-off: SUM ex-VAT turnover per SKU from `total_sales_b2c` (see `_build_sales_revenue_agg_sql`).
 # Implied discount vs ticket is computed in Python: qty × (list_incl_vat / NL_VAT_DIVISOR) − actual ex-VAT revenue.
+# Override: set PG_SALES_REVENUE_COL, or PG_SALES_EX_VAT_AMOUNT_COL in the environment; otherwise the first matching
+# name in _SALES_AMOUNT_COL_AUTODETECT_ORDER is used (see `load_and_merge_data`).
 PG_SALES_REVENUE_COL = os.getenv("PG_SALES_REVENUE_COL", "").strip()
-PG_SALES_EX_VAT_AMOUNT_COL = os.getenv("PG_SALES_EX_VAT_AMOUNT_COL", "amount_lcy")
+
+# When neither PG_SALES_REVENUE_COL nor PG_SALES_EX_VAT_AMOUNT_COL is set in the environment, pick the first
+# column on total_sales_b2c that matches these names (order = preference).
+_SALES_AMOUNT_COL_AUTODETECT_ORDER = (
+    "amount_lcy_discount",
+    "amount_lcy",
+    "turnover_lcy",
+    "amount",
+    "sales_amount",
+    "line_amount",
+    "line_amount_lcy",
+    "net_amount",
+    "amount_excl_vat",
+    "amount_ex_vat",
+    "turnover",
+    "revenue",
+    "sales_value",
+    "total_amount",
+    "sales_amount_lcy",
+)
 
 
 def _validated_identifier(name: str, label: str) -> str:
@@ -72,13 +101,58 @@ def _validated_identifier(name: str, label: str) -> str:
     return str(name)
 
 
-def _sales_revenue_agg_sql() -> str:
-    """Single-column override, or default SUM ex-VAT sales amount per SKU (NL: revenue ex VAT vs list incl VAT in products)."""
+def _fetch_table_columns_lower_map(conn, schema: str, table: str) -> dict[str, str]:
+    """Map lowercase column name -> exact identifier as stored (for quoted SQL)."""
+    rows = conn.execute(
+        text(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = :schema_name AND table_name = :table_name
+            """
+        ),
+        {"schema_name": schema, "table_name": table},
+    ).fetchall()
+    return {row[0].lower(): row[0] for row in rows}
+
+
+def _build_sales_revenue_agg_sql(sales_cols: dict[str, str], schema: str) -> str:
+    """
+    SUM one revenue/amount column per SKU. Uses PG_SALES_REVENUE_COL if set; else PG_SALES_EX_VAT_AMOUNT_COL
+    if set in the environment (must exist); else first matching name in _SALES_AMOUNT_COL_AUTODETECT_ORDER.
+    """
+    fragment = 'SUM(COALESCE("{}"::double precision, 0)) AS sales_revenue_agg'
+    qual = f'{schema}.total_sales_b2c'
+
+    def must_have(col: str, label: str) -> str:
+        key = col.lower()
+        if key not in sales_cols:
+            found = ", ".join(sorted(sales_cols.values())) or "(no columns)"
+            raise ValueError(
+                f'{label}="{col}" is not a column on {qual}. '
+                f"Found: {found}. Set PG_SALES_EX_VAT_AMOUNT_COL or PG_SALES_REVENUE_COL to a real column name."
+            )
+        return sales_cols[key]
+
     if PG_SALES_REVENUE_COL:
-        col = _validated_identifier(PG_SALES_REVENUE_COL, "PG_SALES_REVENUE_COL")
-        return f'SUM(COALESCE("{col}"::double precision, 0)) AS sales_revenue_agg'
-    col = _validated_identifier(PG_SALES_EX_VAT_AMOUNT_COL, "PG_SALES_EX_VAT_AMOUNT_COL")
-    return f'SUM(COALESCE("{col}"::double precision, 0)) AS sales_revenue_agg'
+        quoted = must_have(_validated_identifier(PG_SALES_REVENUE_COL, "PG_SALES_REVENUE_COL"), "PG_SALES_REVENUE_COL")
+        return fragment.format(quoted)
+
+    if "PG_SALES_EX_VAT_AMOUNT_COL" in os.environ:
+        raw = os.environ["PG_SALES_EX_VAT_AMOUNT_COL"]
+        quoted = must_have(_validated_identifier(raw, "PG_SALES_EX_VAT_AMOUNT_COL"), "PG_SALES_EX_VAT_AMOUNT_COL")
+        return fragment.format(quoted)
+
+    for cand in _SALES_AMOUNT_COL_AUTODETECT_ORDER:
+        if cand in sales_cols:
+            return fragment.format(sales_cols[cand])
+
+    found = ", ".join(sorted(sales_cols.values())) or "(no columns)"
+    raise ValueError(
+        f"Could not infer a sales amount column on {qual} (tried "
+        + ", ".join(_SALES_AMOUNT_COL_AUTODETECT_ORDER)
+        + f"). Columns present: {found}. Set PG_SALES_EX_VAT_AMOUNT_COL or PG_SALES_REVENUE_COL."
+    )
 
 
 def get_postgres_config() -> dict:
@@ -132,7 +206,7 @@ def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned
 
 
-def _merged_facts_sql(schema: str) -> str:
+def _merged_facts_sql(schema: str, sales_revenue_agg_sql: str) -> str:
     """Single pass: union keys, aggregate sources, left-join facts (Postgres)."""
     # Identifier injection only from validated config schema (not user input in UI).
     sch = schema.replace('"', "")
@@ -150,7 +224,8 @@ sales_agg AS (
   SELECT
     item_no, colour_no, size, barcode,
     SUM(COALESCE("{SALES_QTY_COL}"::double precision, 0)) AS sales_quantity,
-    {_sales_revenue_agg_sql()},
+    {sales_revenue_agg_sql},
+    MIN("{SALES_DATE_COL}") AS sales_first_order_date,
     MAX("{SALES_DATE_COL}") AS sales_order_date,
     MAX(NULLIF(trim(both from "{SALES_SEASON_COL}"::text), '')) AS sales_season,
     MAX(NULLIF(trim(both from "{SALES_BRAND_COL}"::text), '')) AS sales_brand
@@ -192,6 +267,7 @@ SELECT
   k.barcode,
   s.sales_quantity,
   s.sales_revenue_agg,
+  s.sales_first_order_date,
   s.sales_order_date,
   s.sales_season,
   s.sales_brand,
@@ -226,8 +302,10 @@ def load_and_merge_data() -> pd.DataFrame:
     cfg = get_postgres_config()
     schema = cfg["schema"]
     engine = create_engine(build_connection_url(cfg))
-    sql = _merged_facts_sql(schema)
     with engine.connect() as conn:
+        sales_cols = _fetch_table_columns_lower_map(conn, schema, "total_sales_b2c")
+        revenue_agg = _build_sales_revenue_agg_sql(sales_cols, schema)
+        sql = _merged_facts_sql(schema, revenue_agg)
         df = pd.read_sql(text(sql), conn)
     cleaned = _clean_dataframe(df)
     missing = [key for key in REQUIRED_KEYS if key not in cleaned.columns]
@@ -282,27 +360,55 @@ def missed_revenue_weight(df: pd.DataFrame) -> pd.Series:
     """
     Per-SKU weight in [0, 1] for missed-revenue style metrics.
 
-    Uses gross margin = (ASP − unit_cost) / ASP with ASP = ex-VAT net sales / units (from sales lines).
-    Product list is incl. VAT; revenue is ex VAT — implied discount is not used in this ratio.
-    If net revenue is missing on the row, falls back to list behaviour via ~use_realized mask.
+    Uses gross margin = (ASP − unit_cost) / ASP. ASP is ex-VAT net sales / units only when the row has
+    paid-through net revenue above the giveaway threshold; otherwise ticket ex VAT (`list_price_ex_vat`).
 
-    Weight is 0 when margin is below MARGIN_WRITE_OFF_FLOOR (default 60%): treated as written off /
-    too heavily discounted to count as recoverable missed revenue.
+    Free / comp / giveaway lines (`sales_revenue` ≤ 0 or unit revenue ≤ FREE_OR_GIVEAWAY_UNIT_REVENUE_MAX_EUR)
+    are assumed intentional: they never receive margin-based write-off (weight stays 1), while `sales_qty`
+    and `sales_revenue` still contribute everywhere else.
+
+    Weight is 0 when margin is below MARGIN_WRITE_OFF_FLOOR (default 60%) on **non-giveaway** rows with
+    a realized price signal: treated as written off / too heavily discounted for recoverable missed revenue.
     """
     lp_ex = _numeric(df, "list_price_ex_vat") if "list_price_ex_vat" in df.columns else _numeric(df, "list_price") / NL_VAT_DIVISOR
     cost = _numeric(df, "unit_cost")
     qty = _numeric(df, "sales_qty")
     rev = _numeric(df, "sales_revenue")
-    asp = lp_ex.copy()
     use_realized = (qty > 0) & (rev > 0)
-    asp = asp.where(~use_realized, rev / qty)
+    unit_rev = rev / qty.replace(0, pd.NA)
+    giveaway = (qty > 0) & ((rev <= 0) | (unit_rev <= FREE_OR_GIVEAWAY_UNIT_REVENUE_MAX_EUR))
+    margin_signal = use_realized & ~giveaway
+    asp = lp_ex.copy()
+    asp = asp.where(~margin_signal, rev / qty)
     margin = (asp - cost) / asp.replace(0, pd.NA)
     w = (margin >= MARGIN_WRITE_OFF_FLOOR).astype(float)
     w = w.mask(asp <= 0, 0.0)
     w = w.mask((asp > 0) & margin.isna(), 1.0)
-    # Write-off only when net sales are present (discounts reflected in ASP); else legacy missed revenue.
-    w = w.mask(~use_realized, 1.0)
+    # No margin write-off without a paid-through price signal, or on intentional free lines.
+    w = w.mask(~margin_signal, 1.0)
     return w.clip(0.0, 1.0)
+
+
+def margin_below_writeoff_floor_for_stockout(df: pd.DataFrame) -> pd.Series:
+    """
+    Per-row {0, 1}: 1 only where there is a **realized** (non-giveaway) price signal and gross margin is
+    **strictly below** ``MARGIN_WRITE_OFF_FLOOR`` (and ASP > 0 with finite margin). Used to gate
+    stock-out missed revenue so the demand-vs-stock horizon applies **only** in that margin-distress regime.
+    Giveaway lines and list-only / no paid-through rows → 0.
+    """
+    lp_ex = _numeric(df, "list_price_ex_vat") if "list_price_ex_vat" in df.columns else _numeric(df, "list_price") / NL_VAT_DIVISOR
+    cost = _numeric(df, "unit_cost")
+    qty = _numeric(df, "sales_qty")
+    rev = _numeric(df, "sales_revenue")
+    use_realized = (qty > 0) & (rev > 0)
+    unit_rev = rev / qty.replace(0, pd.NA)
+    giveaway = (qty > 0) & ((rev <= 0) | (unit_rev <= FREE_OR_GIVEAWAY_UNIT_REVENUE_MAX_EUR))
+    margin_signal = use_realized & ~giveaway
+    asp = lp_ex.copy()
+    asp = asp.where(~margin_signal, rev / qty)
+    margin = (asp - cost) / asp.replace(0, pd.NA)
+    distressed = margin_signal & (asp > 0) & margin.notna() & (margin < MARGIN_WRITE_OFF_FLOOR)
+    return distressed.astype(float).clip(0.0, 1.0)
 
 
 def normalize_0_100(values: pd.Series) -> pd.Series:
@@ -334,22 +440,82 @@ def confidence_label(sold_units: float, coverage: float, freshness_days: int, fa
     return "Medium"
 
 
-def compute_kpis(df: pd.DataFrame, horizon_days: int) -> tuple[float, float, float, float]:
+def compute_kpis(df: pd.DataFrame, horizon_days: int, as_of: object | None = None) -> tuple[float, float, float, dict]:
+    """
+    Headline **Total Lost Revenue** = stock-out missed revenue (distressed margin + age filters;
+    see ``stockout_missed_revenue_stats``) + **margin eroded** (overstock × list × ``MARKDOWN_RATE``).
+    Returns ``(lost_revenue, margin_eroded, capital_at_risk, stockout_breakdown)`` where
+    ``stockout_breakdown`` is the full dict from ``stockout_missed_revenue_stats`` for UI merge.
+    """
+    stockout = stockout_missed_revenue_stats(df, horizon_days, as_of)
+    stockout_eur = float(stockout["stockout_missed_revenue_eur"])
     if df.empty:
-        return 0.0, 0.0, 0.0, 0.0
-    daily_rate = df["sales_qty"].sum() / max(horizon_days, 1)
-    expected_units = max(daily_rate * horizon_days, 0)
-    w = missed_revenue_weight(df)
-    raw_lost = (expected_units - df["stock_qty"]).clip(lower=0) * df["list_price"]
-    lost_revenue = float((raw_lost * w).sum())
-    missed_revenue_excluded_writeoff = float((raw_lost * (1.0 - w)).sum())
+        return 0.0, 0.0, 0.0, stockout
     overstock_units = (df["stock_qty"] - df["sales_qty"]).clip(lower=0)
-    margin_eroded = float((overstock_units * df["list_price"] * 0.2).sum())
+    margin_eroded = float((overstock_units * df["list_price"] * MARKDOWN_RATE).sum())
     sell_through = df["sales_qty"] / df["stock_qty"].replace(0, pd.NA)
     capital_at_risk = float(
         (df["stock_qty"] * df["unit_cost"] * (sell_through.fillna(0) < 0.3).astype(float)).sum()
     )
-    return lost_revenue, margin_eroded, capital_at_risk, missed_revenue_excluded_writeoff
+    lost_revenue = stockout_eur + margin_eroded
+    return lost_revenue, margin_eroded, capital_at_risk, stockout
+
+
+def _stockout_first_sale_age_weight(df: pd.DataFrame, as_of: object | None) -> pd.Series:
+    """
+    Per-row multiplier in {0, 1} for stock-out € only: 0 when ``as_of`` is after
+    ``sales_first_order_date`` + STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE weeks.
+
+    Missing ``sales_first_order_date`` or missing ``as_of`` → all 1.0 (no age cut-off).
+    """
+    if as_of is None or df.empty:
+        return pd.Series(1.0, index=df.index, dtype=float)
+    as_ts = pd.Timestamp(as_of).normalize()
+    if "sales_first_order_date" not in df.columns:
+        return pd.Series(1.0, index=df.index, dtype=float)
+    first = pd.to_datetime(df["sales_first_order_date"], errors="coerce")
+    delta = pd.Timedelta(weeks=float(STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE))
+    cutoff = first + delta
+    stale = first.notna() & (as_ts > cutoff)
+    return (~stale).astype(float)
+
+
+def stockout_missed_revenue_stats(df: pd.DataFrame, horizon_days: int, as_of: object | None = None) -> dict[str, float | int]:
+    """
+    Stock-out / understock missed-revenue breakdown for the Executive Summary.
+
+    Same scope-level **horizon** (``daily_rate × horizon_days`` vs ``stock_qty``); the € gap applies
+    **only** where gross margin is **strictly below** ``MARGIN_WRITE_OFF_FLOOR`` with a non-giveaway
+    paid-through price signal, then **first-sale age** weight. This € is **component A** of **Total Lost
+    Revenue**; component B is **margin eroded** in ``compute_kpis``.
+
+    ``stockout_zero_inventory_missed_eur`` isolates rows with no on-hand stock but
+    positive sales (stronger stock-out read).
+    """
+    if df.empty:
+        return {
+            "stockout_missed_revenue_eur": 0.0,
+            "stockout_skus_with_gap": 0,
+            "stockout_zero_inventory_missed_eur": 0.0,
+            "stockout_expected_demand_units": 0.0,
+            "stockout_skus_age_written_off": 0,
+        }
+    daily_rate = df["sales_qty"].sum() / max(horizon_days, 1)
+    expected_units = max(daily_rate * horizon_days, 0)
+    w_margin_distress = margin_below_writeoff_floor_for_stockout(df)
+    w_age = _stockout_first_sale_age_weight(df, as_of)
+    w_stockout = w_margin_distress * w_age
+    gap_units = (expected_units - df["stock_qty"]).clip(lower=0)
+    weighted_eur = gap_units * df["list_price"] * w_stockout
+    zero_oh = (df["stock_qty"] <= 0) & (df["sales_qty"] > 0)
+    skus_age_off = int((w_age < 0.5).sum())
+    return {
+        "stockout_missed_revenue_eur": float(weighted_eur.sum()),
+        "stockout_skus_with_gap": int(((gap_units > 0) & (w_stockout > 0)).sum()),
+        "stockout_zero_inventory_missed_eur": float(weighted_eur.where(zero_oh, 0.0).sum()),
+        "stockout_expected_demand_units": float(expected_units),
+        "stockout_skus_age_written_off": skus_age_off,
+    }
 
 
 def _row_level_risk_frames(df: pd.DataFrame) -> pd.DataFrame:
@@ -361,27 +527,28 @@ def _row_level_risk_frames(df: pd.DataFrame) -> pd.DataFrame:
     w = missed_revenue_weight(out)
     out["_understock_value"] = (out["sales_qty"] - out["stock_qty"]).clip(lower=0) * out["list_price"] * w
     overstock = (out["stock_qty"] - out["sales_qty"]).clip(lower=0)
-    out["_margin_eroded_row"] = overstock * out["list_price"] * 0.2
+    out["_margin_eroded_row"] = overstock * out["list_price"] * MARKDOWN_RATE
     st_ratio = out["sales_qty"] / out["stock_qty"].replace(0, pd.NA)
     slow = (st_ratio.fillna(0) < 0.3).astype(float)
     out["_wc_risk_row"] = out["stock_qty"] * out["unit_cost"] * slow
     return out
 
 
-def build_executive_narrative(df: pd.DataFrame, horizon_days: int) -> tuple[list[str], dict]:
+def build_executive_narrative(df: pd.DataFrame, horizon_days: int, as_of: object | None = None) -> tuple[list[str], dict]:
     """
     Return markdown-friendly headline bullets and KPI numbers for the executive view.
     """
-    lost_rev, margin_er, wc, excl = compute_kpis(df, horizon_days)
+    lost_rev, margin_er, wc, stockout = compute_kpis(df, horizon_days, as_of)
     bullets: list[str] = []
 
     if df.empty:
-        return ["No rows in the current scope — widen filters or change horizon."], {
+        base = {
             "lost_revenue": lost_rev,
             "margin_eroded": margin_er,
             "working_capital": wc,
-            "missed_revenue_excluded_writeoff": excl,
         }
+        base.update(stockout)
+        return ["No rows in the current scope — widen filters or change horizon."], base
 
     enriched = _row_level_risk_frames(df)
 
@@ -420,7 +587,7 @@ def build_executive_narrative(df: pd.DataFrame, horizon_days: int) -> tuple[list
         sz, val = str(by_size_md.index[0]), float(by_size_md.iloc[0])
         bullets.append(
             f"### Markdown pressure\n\nOver-buy vs demand hurts most on **size {sz}** "
-            f"(~**€{val:,.0f}** margin erosion at a 20% markdown assumption)."
+            f"(~**€{val:,.0f}** margin erosion at a {MARKDOWN_RATE:.0%} markdown assumption)."
         )
 
     # Buy vs demand gap (percentage points) at scope level
@@ -440,12 +607,13 @@ def build_executive_narrative(df: pd.DataFrame, horizon_days: int) -> tuple[list
     if not bullets:
         bullets.append("### Snapshot\n\nNo major anomalies detected in this scope — KPIs look relatively balanced.")
 
-    return bullets, {
+    base_kpis = {
         "lost_revenue": lost_rev,
         "margin_eroded": margin_er,
         "working_capital": wc,
-        "missed_revenue_excluded_writeoff": excl,
     }
+    base_kpis.update(stockout)
+    return bullets, base_kpis
 
 
 def _resolve_profile_local(

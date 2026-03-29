@@ -105,6 +105,23 @@ def render_profile(selected_size_group: str, selected_style: str) -> None:
         st.markdown("##### 1. Curve comparison (same PO quantity)")
         render_optimization_po_curve_comparison(detail)
 
+        # Temporary debug view to inspect curve inputs per size.
+        with st.expander("Debug: curve inputs by size", expanded=False):
+            st.dataframe(
+                detail[
+                    [
+                        "Size",
+                        "hist_buy_share",
+                        "optimal_demand_share",
+                        "qty_historical_at_target",
+                        "qty_optimal_at_target",
+                        "po_share_historical_curve",
+                        "po_share_optimal_curve",
+                    ]
+                ].sort_values("Size"),
+                hide_index=True,
+            )
+
     with st.container(border=True):
         st.markdown("##### 2. Gap and projected margin by size")
         render_optimization_gap_and_margin(detail)

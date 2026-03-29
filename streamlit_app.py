@@ -53,23 +53,19 @@ Global filters (brands, size groups, horizon window) **restrict which rows** ent
 
 All three use the **same filtered scope** and **horizon length** (days) from the sidebar.
 
-1. **Total Lost Revenue (proxy)**  
-   - Compute scope-level `daily_rate = sum(sales_qty) / horizon_days`.  
-   - Set `expected_units = daily_rate × horizon_days` (equals total sold units in scope).  
-   - For **each row**, raw € = `max(expected_units − stock_qty, 0) × list_price`.  
-   - **Write-off / margin:** **ASP** uses **ex-VAT** actual revenue ÷ units from the sales table. **Product list** is **incl. VAT**; **`list_price_ex_vat = list ÷ 1.21`** for ticket comparisons and as fallback ASP when line revenue is missing. Gross margin = `(ASP_ex_VAT − unit_cost) / ASP_ex_VAT`. If margin **< 60%** (`MARGIN_WRITE_OFF_FLOOR`), weight is **0** (*written off*). If there is no positive net revenue on the row, the fallback uses ticket ex VAT. **Implied discount €** = `qty × list_ex_VAT − actual ex-VAT revenue` (for transparency, not the headline lost-revenue formula).  
-   - The UI can show **missed revenue excluded** = raw € zeroed by write-off rules when net sales are present.  
-   - *Interpretation:* stylized proxy for understock value on **viable** margin; not a literal lost-sales audit. The scalar `expected_units` is still shared across rows by construction.
+1. **Total Lost Revenue (proxy)** — **sum of two components** (same scope and horizon):  
+   - **A — Stock-out missed revenue:** `daily_rate × horizon` → `expected_units`; per row `max(expected_units − stock_qty, 0) × list_price`, included **only** where gross margin (realized ASP ex VAT vs unit cost) is **strictly below** `MARGIN_WRITE_OFF_FLOOR` on a non-giveaway paid-through line (`margin_below_writeoff_floor_for_stockout`), then multiplied by **age** weight: **0** if sidebar **as-of** is more than **`STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE`** weeks after **`sales_first_order_date`**. See `stockout_missed_revenue_stats`.  
+   - **B — Margin eroded:** per row `max(stock_qty − sales_qty, 0) × list_price × MARKDOWN_RATE` (default **30%** markdown on excess units).  
+   - **Total lost revenue = A + B** (`compute_kpis`). *Interpretation:* combined stylized proxies — distressed-margin understock at list plus markdown risk on overstock; not a literal P&L reconciliation.
 
-2. **Total Margin Eroded (proxy)**  
-   - For each row: `max(stock_qty − sales_qty, 0) × list_price × 20%`.  
-   - **20%** is a fixed markdown assumption (`MARKDOWN_RATE` in code).  
-   - *Interpretation:* rough € impact if excess stock is cleared through markdown at that rate.
+2. **Total Margin Eroded (proxy)** — **component B** above (also shown separately in the UI).
 
 3. **Working Capital at Risk**  
    - Sell-through per row: `sales_qty / stock_qty` (zero stock avoids divide-by-zero).  
    - For rows with sell-through **< 30%**, add `stock_qty × unit_cost`.  
    - *Interpretation:* capital tied up in slow-moving SKUs under this rule.
+
+**Missed revenue from stock-outs** (dedicated panel) is **component A** of *Total Lost Revenue*: same **horizon** and `expected_units`, list-price gap with `margin_below_writeoff_floor_for_stockout` and **age** (`STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE`, `sales_first_order_date`). **Component B** is *Total Margin Eroded*. Executive **Key metrics** shows **A + B** as *Total Lost Revenue*.
 
 ---
 
@@ -78,7 +74,7 @@ All three use the **same filtered scope** and **horizon length** (days) from the
 These **do not** necessarily reconcile to the three headline totals; they highlight **where** signals concentrate (by size / segment).
 
 - **Demand not covered by stock:** Row proxy `(sales_qty − stock_qty).clip(lower=0) × list_price × write-off weight` (same margin rule as headline), aggregated by **size** — largest bar drives the bullet.  
-- **Markdown pressure:** Row proxy `max(stock − sales, 0) × list × 20%`, aggregated by **size**.  
+- **Markdown pressure:** Row proxy `max(stock − sales, 0) × list × 30%`, aggregated by **size**.  
 - **Buy curve vs demand:** Within the scope, `buy_share` = share of total `buy_qty` by size; `demand_share` = share of total `sales_qty` by size. **Gap** = `(demand_share − buy_share) × 100` percentage points; the bullet cites the size with the largest absolute gap.  
 - **Working capital narrative:** Sums `stock × unit_cost` for slow sellers at **size_group × category**, then drills into **size** within the worst segment.
 
@@ -103,7 +99,7 @@ Same share definitions as the chart above. **Gap (percentage points)** = `(deman
 Per profile `(brand, category, fit, size_group)`:
 
 - **Missed revenue (raw):** sum of row-level `max(sold − stock, 0) × list × write-off weight` within the profile (not avg list × aggregate gap).  
-- **Markdown risk (raw):** `max(stock − sold, 0) × avg list × 20%`.  
+- **Markdown risk (raw):** `max(stock − sold, 0) × avg list × 30%`.  
 - **Mismatch severity (raw):** `|buy_units − sold_units|`.  
 - Each raw column is **scaled 0–100** within the current shortlist (`normalize_0_100`).  
 - **Blended score** = `0.40 × missed + 0.35 × markdown + 0.25 × mismatch`.  
@@ -116,7 +112,7 @@ Per profile `(brand, category, fit, size_group)`:
 When you change the PO target quantity, the engine reallocates units with **largest remainder** so integer quantities match the target. **Optimal** curve uses **sales** shares; **historical** curve uses **buy** shares. Per-size € line uses:
 
 - **Extra units** (optimal > historical): `delta_qty × list × 35%` (`INCREMENTAL_CONTRIBUTION_RATE`).  
-- **Fewer units** (optimal < historical): `|delta_qty| × list × 20%` as avoided markdown risk (`MARKDOWN_RATE`).  
+- **Fewer units** (optimal < historical): `|delta_qty| × list × 30%` as avoided markdown risk (`MARKDOWN_RATE`).  
 
 ---
 

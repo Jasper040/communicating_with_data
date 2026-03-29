@@ -162,7 +162,7 @@ Coverage ratio definition:
 - Total Lost Revenue:
   - `sum(max(0, expected_units - available_units) * list_price)` where `expected_units` is mean weekly demand scaled to horizon.
 - Total Margin Eroded:
-  - `sum(overstock_units * markdown_rate * list_price)` using default markdown_rate 20%.
+  - `sum(overstock_units * markdown_rate * list_price)` using default markdown_rate 30%.
 - Working Capital at Risk:
   - `sum(on_hand_units * unit_cost)` for units with sell-through below threshold (default 30% in horizon).
 

@@ -4,7 +4,7 @@ st.set_page_config(page_title="Action Queue | Buying", layout="wide")
 
 from app_shell import render_app_shell, render_scope_summary
 from charts import render_action_queue_priority_chart
-from data_loader import missed_revenue_weight, normalize_0_100
+from data_loader import MARKDOWN_RATE, missed_revenue_weight, normalize_0_100
 
 st.header("Action Queue")
 
@@ -37,7 +37,9 @@ profile = (
     )
     .reset_index()
 )
-profile["markdown_risk_raw"] = (profile["stock_units"] - profile["sold_units"]).clip(lower=0) * profile["avg_price"] * 0.2
+profile["markdown_risk_raw"] = (
+    (profile["stock_units"] - profile["sold_units"]).clip(lower=0) * profile["avg_price"] * MARKDOWN_RATE
+)
 profile["mismatch_raw"] = (profile["buy_units"] - profile["sold_units"]).abs()
 profile["missed_revenue_score"] = normalize_0_100(profile["missed_revenue_raw"])
 profile["markdown_risk_score"] = normalize_0_100(profile["markdown_risk_raw"])
