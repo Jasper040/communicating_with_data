@@ -105,21 +105,32 @@ def render_profile(selected_size_group: str, selected_style: str) -> None:
         st.markdown("##### 1. Curve comparison (same PO quantity)")
         render_optimization_po_curve_comparison(detail)
 
-        # Temporary debug view to inspect curve inputs per size.
-        with st.expander("Debug: curve inputs by size", expanded=False):
+        with st.container(border=True):
+            st.markdown("##### Desired PO by size")
+            st.caption(
+                f"Unit line to place on **this PO** when you follow the **demand-optimal** mix and keep total order size at "
+                f"**{meta['target_qty']:,}** (same largest-remainder allocation as the chart above)."
+            )
+            desired_po = (
+                detail.assign(rec_po_pct=lambda d: (d["po_share_optimal_curve"] * 100).round(1))[
+                    ["Size", "qty_optimal_at_target", "rec_po_pct"]
+                ]
+                .rename(
+                    columns={
+                        "qty_optimal_at_target": "Recommended units",
+                        "rec_po_pct": "% of PO",
+                    }
+                )
+                .sort_values("Size")
+            )
             st.dataframe(
-                detail[
-                    [
-                        "Size",
-                        "hist_buy_share",
-                        "optimal_demand_share",
-                        "qty_historical_at_target",
-                        "qty_optimal_at_target",
-                        "po_share_historical_curve",
-                        "po_share_optimal_curve",
-                    ]
-                ].sort_values("Size"),
+                desired_po,
+                width="stretch",
                 hide_index=True,
+                column_config={
+                    "Recommended units": st.column_config.NumberColumn(format="%d"),
+                    "% of PO": st.column_config.NumberColumn(format="%.1f"),
+                },
             )
 
     with st.container(border=True):

@@ -41,7 +41,7 @@ MARGIN_WRITE_OFF_FLOOR = float(os.getenv("MARGIN_WRITE_OFF_FLOOR", "0.60"))
 FREE_OR_GIVEAWAY_UNIT_REVENUE_MAX_EUR = float(os.getenv("FREE_OR_GIVEAWAY_UNIT_REVENUE_MAX_EUR", "0.01"))
 
 # Stock-out missed revenue only: zero weight when as-of is more than this many weeks after first sale (per SKU in merge).
-STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE = float(os.getenv("STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE", "20"))
+STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE = float(os.getenv("STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE", "8"))
 
 # Products list price (`sales_listprice`) is incl. 21% NL VAT; sales table amounts are ex VAT — divide for like-for-like.
 NL_VAT_DIVISOR = float(os.getenv("NL_VAT_DIVISOR", "1.21"))
@@ -442,13 +442,13 @@ def confidence_label(sold_units: float, coverage: float, freshness_days: int, fa
 
 def compute_kpis(df: pd.DataFrame, horizon_days: int, as_of: object | None = None) -> tuple[float, float, float, dict]:
     """
-    Headline **Total Lost Revenue** = stock-out missed revenue (distressed margin + age filters;
-    see ``stockout_missed_revenue_stats``) + **margin eroded** (overstock × list × ``MARKDOWN_RATE``).
+    Headline **Total Lost Revenue** = **margin eroded** (overstock × list × ``MARKDOWN_RATE``)
+    + **working capital at risk** (slow sell-through rule). Stock-out stats are returned separately
+    for the Executive stock-outs panel only (see ``stockout_missed_revenue_stats``).
     Returns ``(lost_revenue, margin_eroded, capital_at_risk, stockout_breakdown)`` where
     ``stockout_breakdown`` is the full dict from ``stockout_missed_revenue_stats`` for UI merge.
     """
     stockout = stockout_missed_revenue_stats(df, horizon_days, as_of)
-    stockout_eur = float(stockout["stockout_missed_revenue_eur"])
     if df.empty:
         return 0.0, 0.0, 0.0, stockout
     overstock_units = (df["stock_qty"] - df["sales_qty"]).clip(lower=0)
@@ -457,7 +457,7 @@ def compute_kpis(df: pd.DataFrame, horizon_days: int, as_of: object | None = Non
     capital_at_risk = float(
         (df["stock_qty"] * df["unit_cost"] * (sell_through.fillna(0) < 0.3).astype(float)).sum()
     )
-    lost_revenue = stockout_eur + margin_eroded
+    lost_revenue = margin_eroded + capital_at_risk
     return lost_revenue, margin_eroded, capital_at_risk, stockout
 
 
@@ -482,15 +482,14 @@ def _stockout_first_sale_age_weight(df: pd.DataFrame, as_of: object | None) -> p
 
 def stockout_missed_revenue_stats(df: pd.DataFrame, horizon_days: int, as_of: object | None = None) -> dict[str, float | int]:
     """
-    Stock-out / understock missed-revenue breakdown for the Executive Summary.
+    Stock-out / understock missed-revenue breakdown for the Executive Summary (informational only).
 
     Same scope-level **horizon** (``daily_rate × horizon_days`` vs ``stock_qty``); the € gap applies
     **only** where gross margin is **strictly below** ``MARGIN_WRITE_OFF_FLOOR`` with a non-giveaway
-    paid-through price signal, then **first-sale age** weight. This € is **component A** of **Total Lost
-    Revenue**; component B is **margin eroded** in ``compute_kpis``.
+    paid-through price signal, then **first-sale age** weight.
 
-    ``stockout_zero_inventory_missed_eur`` isolates rows with no on-hand stock but
-    positive sales (stronger stock-out read).
+    **Rows with no on-hand stock but positive sales are excluded** from ``stockout_missed_revenue_eur``;
+    their counterfactual € is still reported in ``stockout_zero_inventory_missed_eur`` for diagnostics.
     """
     if df.empty:
         return {
@@ -508,10 +507,11 @@ def stockout_missed_revenue_stats(df: pd.DataFrame, horizon_days: int, as_of: ob
     gap_units = (expected_units - df["stock_qty"]).clip(lower=0)
     weighted_eur = gap_units * df["list_price"] * w_stockout
     zero_oh = (df["stock_qty"] <= 0) & (df["sales_qty"] > 0)
+    eur_reported = weighted_eur.where(~zero_oh, 0.0)
     skus_age_off = int((w_age < 0.5).sum())
     return {
-        "stockout_missed_revenue_eur": float(weighted_eur.sum()),
-        "stockout_skus_with_gap": int(((gap_units > 0) & (w_stockout > 0)).sum()),
+        "stockout_missed_revenue_eur": float(eur_reported.sum()),
+        "stockout_skus_with_gap": int(((gap_units > 0) & (w_stockout > 0) & (~zero_oh)).sum()),
         "stockout_zero_inventory_missed_eur": float(weighted_eur.where(zero_oh, 0.0).sum()),
         "stockout_expected_demand_units": float(expected_units),
         "stockout_skus_age_written_off": skus_age_off,

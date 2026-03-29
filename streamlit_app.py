@@ -54,18 +54,15 @@ Global filters (brands, size groups, horizon window) **restrict which rows** ent
 All three use the **same filtered scope** and **horizon length** (days) from the sidebar.
 
 1. **Total Lost Revenue (proxy)** — **sum of two components** (same scope and horizon):  
-   - **A — Stock-out missed revenue:** `daily_rate × horizon` → `expected_units`; per row `max(expected_units − stock_qty, 0) × list_price`, included **only** where gross margin (realized ASP ex VAT vs unit cost) is **strictly below** `MARGIN_WRITE_OFF_FLOOR` on a non-giveaway paid-through line (`margin_below_writeoff_floor_for_stockout`), then multiplied by **age** weight: **0** if sidebar **as-of** is more than **`STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE`** weeks after **`sales_first_order_date`**. See `stockout_missed_revenue_stats`.  
-   - **B — Margin eroded:** per row `max(stock_qty − sales_qty, 0) × list_price × MARKDOWN_RATE` (default **30%** markdown on excess units).  
-   - **Total lost revenue = A + B** (`compute_kpis`). *Interpretation:* combined stylized proxies — distressed-margin understock at list plus markdown risk on overstock; not a literal P&L reconciliation.
+   - **Margin eroded:** per row `max(stock_qty − sales_qty, 0) × list_price × MARKDOWN_RATE` (default **30%** markdown on excess units).  
+   - **Working capital at risk:** for rows with sell-through **< 30%**, `stock_qty × unit_cost` (sell-through = `sales_qty / stock_qty`, with zero stock handled safely).  
+   - **Total lost revenue = margin eroded + working capital at risk** (`compute_kpis`). *Interpretation:* combined stylized proxies for markdown risk on overstock and capital tied up in slow movers; not a literal P&L reconciliation.
 
-2. **Total Margin Eroded (proxy)** — **component B** above (also shown separately in the UI).
+2. **Total Margin Eroded (proxy)** — same as the margin-eroded component above (also shown separately in the UI).
 
-3. **Working Capital at Risk**  
-   - Sell-through per row: `sales_qty / stock_qty` (zero stock avoids divide-by-zero).  
-   - For rows with sell-through **< 30%**, add `stock_qty × unit_cost`.  
-   - *Interpretation:* capital tied up in slow-moving SKUs under this rule.
+3. **Working Capital at Risk** — same as the WC component above (also shown separately in the UI).
 
-**Missed revenue from stock-outs** (dedicated panel) is **component A** of *Total Lost Revenue*: same **horizon** and `expected_units`, list-price gap with `margin_below_writeoff_floor_for_stockout` and **age** (`STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE`, `sales_first_order_date`). **Component B** is *Total Margin Eroded*. Executive **Key metrics** shows **A + B** as *Total Lost Revenue*.
+**Missed revenue from stock-outs** (dedicated panel) is a **separate** proxy, **not** included in *Total Lost Revenue*: same **horizon** and `expected_units` from `stockout_missed_revenue_stats`, list-price gap with `margin_below_writeoff_floor_for_stockout` and **age** — rows get **zero** stock-out weight when **as-of** is after `sales_first_order_date` + **`STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE`** weeks (default **8**, env override). **Rows with no on-hand stock but positive sales are excluded** from the stock-out €.
 
 ---
 

@@ -4,7 +4,7 @@ st.set_page_config(page_title="Executive Summary | Buying", layout="wide")
 
 from app_shell import render_app_shell, render_scope_summary
 from charts import render_bleed_chart
-from data_loader import build_executive_narrative
+from data_loader import STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE, build_executive_narrative
 
 st.header("The Bleed (Executive)")
 
@@ -28,27 +28,24 @@ with st.container(border=True):
 with st.container(border=True):
     st.markdown("##### Missed revenue from stock-outs")
     st.caption(
-        "**Component A** of *Total Lost Revenue (proxy)* — see **Key metrics**. Horizon / run-rate gap only when "
+        "**Separate proxy** (not included in *Total Lost Revenue* in **Key metrics**). Horizon / run-rate gap only when "
         "**realized gross margin is below the write-off floor** (paid-through lines, not giveaways), valued at list, "
-        "then **aged out** after **20 weeks** from first sale vs **as-of**."
+        f"then **aged out** after **{STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE:g} weeks** from first sale vs **as-of**. **Excludes** rows with **no on-hand stock** "
+        "but positive sales."
     )
     s_eur = float(kpis.get("stockout_missed_revenue_eur", 0.0))
     s_skus = int(kpis.get("stockout_skus_with_gap", 0))
     s_dem = float(kpis.get("stockout_expected_demand_units", 0.0))
-    z_eur = float(kpis.get("stockout_zero_inventory_missed_eur", 0.0))
     m1, m2 = st.columns(2)
     m1.metric("Stock-out missed revenue (proxy)", f"€ {s_eur:,.0f}")
     m2.metric("SKU-size rows with demand > stock", f"{s_skus:,}")
     if s_dem > 0:
         st.caption(f"Scope-level implied demand over the horizon: **{s_dem:,.0f}** units (vs. sum of on-hand rows).")
-    if z_eur > 0:
-        st.caption(
-            f"**€ {z_eur:,.0f}** of that sits on rows with **no reported stock** but **positive sales** "
-            "(stronger out-of-stock signal)."
-        )
     age_n = int(kpis.get("stockout_skus_age_written_off", 0))
     if age_n > 0:
-        st.caption(f"**{age_n:,}** SKU-size rows are excluded here only (first sale + 20 weeks before as-of).")
+        st.caption(
+            f"**{age_n:,}** SKU-size rows are excluded here only (first sale + {STOCKOUT_WRITE_OFF_WEEKS_AFTER_FIRST_SALE:g} weeks before as-of)."
+        )
     elif s_eur <= 0:
         st.info(
             "No stock-out € in this scope: either no demand-vs-stock gap, no SKUs below the margin floor with a "
@@ -61,11 +58,11 @@ with st.container(border=True):
     c1.metric("Total Lost Revenue (proxy)", f"€ {kpis['lost_revenue']:,.0f}")
     c2.metric("Total Margin Eroded (proxy)", f"€ {kpis['margin_eroded']:,.0f}")
     c3.metric("Working Capital at Risk", f"€ {kpis['working_capital']:,.0f}")
-    so = float(kpis.get("stockout_missed_revenue_eur", 0.0))
     me = float(kpis.get("margin_eroded", 0.0))
+    wc = float(kpis.get("working_capital", 0.0))
     st.caption(
-        f"**Total lost revenue** = stock-out missed revenue (**€ {so:,.0f}**) + margin eroded (**€ {me:,.0f}**). "
-        "See the stock-outs section and Methodology."
+        f"**Total lost revenue** = total margin eroded (**€ {me:,.0f}**) + working capital at risk (**€ {wc:,.0f}**). "
+        "Stock-out proxy is separate; see Methodology."
     )
     st.caption(
         "How these figures are computed (including proxies, the 30% markdown assumption, and how "
